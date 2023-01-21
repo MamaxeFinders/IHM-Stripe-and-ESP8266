@@ -1,0 +1,73 @@
+//this is a function that fires when the webapp receives a GET request
+function doGet(e) {
+  var output = ContentService.createTextOutput();
+  output.setContent("GET");
+return output;
+}
+
+//this is a function that fires when the webapp receives a POST request
+function doPost(e) {
+  var params = JSON.stringify(e.postData.contents);
+  params = JSON.parse(params);
+  var myData = JSON.parse(e.postData.contents);
+  ExtractSTRIPEinfo (myData);
+  var ESPreturn = TransferJSONtoESP(myData);
+  SpreadsheetApp.flush();
+  var output = HtmlService.createHtmlOutput()
+    .setTitle('ESP VALIDATION : ' + ESPreturn);
+return output;
+}
+
+var Sheet_ID = "11TMmY-XXXXXXpuw" // to change with your Sheet ID
+var ss = SpreadsheetApp.openById(Sheet_ID);
+
+function ExtractSTRIPEinfo (JSONdataStripe){
+  var StripeLog_sheet = ss.getSheetByName("StripeLog");
+  var DATArange = ss.getRangeByName("JSONinfo");
+  var JSONvalues = DATArange.getValues();
+  var GETdataValues = []
+    for (var i=0; i<JSONvalues[0].length;i++){ // read all JSON data as per cell from StripeLog range
+      var JSONdataoutput = JSONdataStripe
+      var DATAsplit = []
+      if(JSONvalues[0][i].includes(".")){
+      DATAsplit = JSONvalues[0][i].split(".")
+          //Logger.log(DATAsplit)
+        for (var j=0; j<DATAsplit.length;j++){
+           JSONdataoutput = JSONdataoutput[DATAsplit[j]]
+          //Logger.log(DATAsplit[j])
+        }
+        Logger.log(JSONdataoutput)
+        GETdataValues.push(JSONdataoutput)
+      }else{
+        JSONdataoutput = JSONdataoutput[JSONvalues[0][i]]
+        //Logger.log(JSONdataoutput)
+        GETdataValues.push(JSONdataoutput)
+      }
+    }
+    Logger.log(GETdataValues)
+      var TodayDATE = Utilities.formatDate(new Date(), "GMT+2", "dd.MM.yyyy  HH:mm") // For French time zone
+      GETdataValues.push(TodayDATE)
+    StripeLog_sheet.appendRow(GETdataValues)
+}
+
+function TransferJSONtoESP(JSONdataStripe) {
+  //Logger.log(JSONdata)
+  var Sheet_ID = "11TMmYXXXXXXXXXpuw" // to change with your Sheet ID
+  var ss = SpreadsheetApp.openById(Sheet_ID);
+  var url = ss.getRangeByName("ESP_IP").getValue()
+Logger.log(url)
+  var options = {
+    contentType : "application/json;",
+    headers: { Authorization: "Bearer " + ScriptApp.getOAuthToken() },
+    method : 'get',
+    payload: JSON.stringify(JSONdataStripe),
+    muteHttpExceptions: true
+  };
+
+  var response = UrlFetchApp.fetch(url,options); // creates webhook
+  Logger.log(response)
+  var ss = SpreadsheetApp.getActive();
+  var ESPLog_sheet = ss.getSheetByName("ESPLog");
+  ESPLog_sheet.appendRow([response])
+  return response
+}
