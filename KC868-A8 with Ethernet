@@ -1,0 +1,275 @@
+#include <Arduino.h>
+#include <esp_arduino_version.h>
+
+// ===== Ethernet PHY config =====
+#define ETH_PHY_TYPE   ETH_PHY_LAN8720
+#define ETH_PHY_ADDR   0
+#define ETH_PHY_MDC    23
+#define ETH_PHY_MDIO   18
+#define ETH_PHY_POWER  -1
+#define ETH_CLK_MODE   ETH_CLOCK_GPIO17_OUT
+
+#include <WiFi.h>
+#include <ETH.h>
+#include <WebServer.h>
+#include <ArduinoJson.h>
+#include <PCF8574.h>
+
+#define ARDUINOJSON_DEFAULT_NESTING_LIMIT 20
+
+// ===== KC868-A8v2 I2C / Relay board =====
+// KinCony examples use PCF8574(0x24,4,5)
+PCF8574 relayBoard(0x24, 4, 5);
+
+WebServer server(80);
+StaticJsonDocument<2500> jsonDocument;
+
+// ===== Relay mapping =====
+#define RELAY1 P0
+#define RELAY2 P1
+#define RELAY3 P2
+#define RELAY4 P3
+
+volatile bool eth_connected = false;
+
+// One request = one pulse job
+int pendingPiste = 0;
+int pendingSessions = 0;
+bool pulsePending = false;
+
+// =====================================================
+// Relay logic
+// KinCony relays are active LOW:
+// LOW  = ON
+// HIGH = OFF
+// =====================================================
+void relayOn(uint8_t pin) {
+  relayBoard.digitalWrite(pin, LOW);
+}
+
+void relayOff(uint8_t pin) {
+  relayBoard.digitalWrite(pin, HIGH);
+}
+
+void allRelaysOff() {
+  relayOff(RELAY1);
+  relayOff(RELAY2);
+  relayOff(RELAY3);
+  relayOff(RELAY4);
+  relayBoard.digitalWrite(P4, HIGH);
+  relayBoard.digitalWrite(P5, HIGH);
+  relayBoard.digitalWrite(P6, HIGH);
+  relayBoard.digitalWrite(P7, HIGH);
+}
+
+void pulseOnlyOneRelay(int piste) {
+  allRelaysOff();
+  delay(50);
+
+  switch (piste) {
+    case 1:
+      Serial.println("Pulse RELAY1");
+      relayOn(RELAY1);
+      delay(1000);
+      relayOff(RELAY1);
+      break;
+
+    case 2:
+      Serial.println("Pulse RELAY2");
+      relayOn(RELAY2);
+      delay(1000);
+      relayOff(RELAY2);
+      break;
+
+    case 3:
+      Serial.println("Pulse RELAY3");
+      relayOn(RELAY3);
+      delay(1000);
+      relayOff(RELAY3);
+      break;
+
+    case 4:
+      Serial.println("Pulse RELAY4");
+      relayOn(RELAY4);
+      delay(1000);
+      relayOff(RELAY4);
+      break;
+
+    default:
+      Serial.println("Invalid piste");
+      break;
+  }
+
+  delay(200);
+  allRelaysOff();
+}
+
+// =====================================================
+// Ethernet events
+// =====================================================
+void onEthEvent(WiFiEvent_t event) {
+  switch (event) {
+    case ARDUINO_EVENT_ETH_START:
+      Serial.println("ETH Started");
+      ETH.setHostname("kc868-a8v2-stripe");
+      break;
+
+    case ARDUINO_EVENT_ETH_CONNECTED:
+      Serial.println("ETH Connected");
+      break;
+
+    case ARDUINO_EVENT_ETH_GOT_IP:
+      Serial.print("ETH IP: ");
+      Serial.println(ETH.localIP());
+      eth_connected = true;
+      break;
+
+    case ARDUINO_EVENT_ETH_DISCONNECTED:
+      Serial.println("ETH Disconnected");
+      eth_connected = false;
+      break;
+
+    case ARDUINO_EVENT_ETH_STOP:
+      Serial.println("ETH Stopped");
+      eth_connected = false;
+      break;
+
+    default:
+      break;
+  }
+}
+
+// =====================================================
+// HTTP handlers
+// =====================================================
+void handlePing() {
+  server.send(200, "text/plain", "OK");
+}
+
+void handleBody() {
+  if (!server.hasArg("plain")) {
+    server.send(200, "text/plain", "Requette recue sans donnees");
+    return;
+  }
+
+  String body = server.arg("plain");
+
+  Serial.println("BODY RECEIVED:");
+  Serial.println(body);
+
+  DeserializationError err = deserializeJson(jsonDocument, body);
+  if (err) {
+    Serial.print("JSON error: ");
+    Serial.println(err.c_str());
+    server.send(400, "text/plain", "JSON decode error");
+    return;
+  }
+
+  String prixUneSession = jsonDocument["data"]["object"]["metadata"]["PrixUneSession"] | "";
+  String prixDeuxSessions = jsonDocument["data"]["object"]["metadata"]["PrixDeuxSessions"] | "";
+  String pisteStr = jsonDocument["data"]["object"]["metadata"]["Piste"] | "";
+  String credit = jsonDocument["data"]["object"]["amount_total"] | "";
+  String transactionID = jsonDocument["id"] | "";
+
+  int piste = pisteStr.toInt();
+  int creditValue = credit.toInt();
+  int prixUneSessionValue = prixUneSession.toInt();
+  int prixDeuxSessionsValue = prixDeuxSessions.toInt();
+  int sessions = 0;
+
+  if (prixDeuxSessionsValue > 0 && creditValue >= prixDeuxSessionsValue) {
+    sessions = 2;
+  } else if (prixUneSessionValue > 0 && creditValue >= prixUneSessionValue) {
+    sessions = 1;
+  } else {
+    sessions = 1; // fallback
+  }
+
+  pendingPiste = piste;
+  pendingSessions = sessions;
+  pulsePending = true;
+
+  Serial.println("PISTE : " + String(piste));
+  Serial.println("CREDIT : " + credit);
+  Serial.println("PRIX UNE SESSION : " + prixUneSession);
+  Serial.println("PRIX DEUX SESSIONS : " + prixDeuxSessions);
+  Serial.println("NOMBRE DE SESSIONS : " + String(sessions));
+
+  server.send(200, "text/plain",
+              "Succes : =>" + transactionID + "<= Piste " + pisteStr +
+              " activee pour " + credit + " euros et " +
+              String(sessions) + " sessions");
+}
+
+// =====================================================
+// Setup
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("Booting KC868-A8v2 Stripe Activation Board...");
+
+  // Configure ALL PCF8574 pins as outputs
+  relayBoard.pinMode(P0, OUTPUT);
+  relayBoard.pinMode(P1, OUTPUT);
+  relayBoard.pinMode(P2, OUTPUT);
+  relayBoard.pinMode(P3, OUTPUT);
+  relayBoard.pinMode(P4, OUTPUT);
+  relayBoard.pinMode(P5, OUTPUT);
+  relayBoard.pinMode(P6, OUTPUT);
+  relayBoard.pinMode(P7, OUTPUT);
+
+  if (!relayBoard.begin()) {
+    Serial.println("PCF8574 relay board not found!");
+  } else {
+    Serial.println("PCF8574 relay board found.");
+  }
+
+  // Default state = ALL RELAYS OFF
+  allRelaysOff();
+  delay(200);
+  allRelaysOff();
+
+  WiFi.onEvent(onEthEvent);
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ETH.begin(ETH_PHY_TYPE, ETH_PHY_ADDR, ETH_PHY_MDC, ETH_PHY_MDIO, ETH_PHY_POWER, ETH_CLK_MODE);
+#else
+  ETH.begin(ETH_PHY_ADDR, ETH_PHY_POWER, ETH_PHY_MDC, ETH_PHY_MDIO, ETH_PHY_TYPE, ETH_CLK_MODE);
+#endif
+
+  while (!eth_connected) {
+    delay(500);
+    Serial.println("Waiting for Ethernet...");
+  }
+
+  Serial.print("Board IP address: ");
+  Serial.println(ETH.localIP());
+
+  server.on("/body", HTTP_ANY, handleBody);
+  server.on("/ping", HTTP_GET, handlePing);
+  server.begin();
+
+  Serial.println("HTTP server started");
+}
+
+// =====================================================
+// Main loop
+// =====================================================
+void loop() {
+  server.handleClient();
+
+  if (pulsePending) {
+    pulsePending = false;
+
+    // Original logic: if 1 session => one pulse, if 2 sessions => two pulses
+    for (int i = 0; i < pendingSessions; i++) {
+      pulseOnlyOneRelay(pendingPiste);
+      delay(1000);
+    }
+
+    pendingPiste = 0;
+    pendingSessions = 0;
+    allRelaysOff();
+  }
+}
