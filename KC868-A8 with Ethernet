@@ -28,7 +28,7 @@ StaticJsonDocument<2500> jsonDocument;
 #define RELAY1 P0
 #define RELAY2 P1
 #define RELAY3 P2
-#define RELAY4 P3
+#define RELAY4 P3 //<= Changed to P4 on defective card
 
 volatile bool eth_connected = false;
 
