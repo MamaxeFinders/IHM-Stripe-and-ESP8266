@@ -43,58 +43,29 @@ const uint16_t RELAY_PULSE_ON_MS = 140;
 const uint16_t RELAY_POST_PULSE_MS = 80;
 const uint16_t RELAY_INTER_PULSE_GAP_MS = 180;
 
-PCF8574::DigitalInput relayState = {HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH, HIGH};
-
 // =====================================================
 // Relay logic
 // KinCony relays are active LOW:
 // LOW  = ON
 // HIGH = OFF
 // =====================================================
-bool applyRelayState() {
-  return relayBoard.digitalWriteAll(relayState);
+void relayOn(uint8_t pin) {
+  relayBoard.digitalWrite(pin, LOW);
 }
 
-void setOnlyRelayActive(int piste) {
-  relayState.p0 = HIGH;
-  relayState.p1 = HIGH;
-  relayState.p2 = HIGH;
-  relayState.p3 = HIGH;
-  relayState.p4 = HIGH;
-  relayState.p5 = HIGH;
-  relayState.p6 = HIGH;
-  relayState.p7 = HIGH;
-
-  switch (piste) {
-    case 1:
-      relayState.p0 = LOW;
-      break;
-    case 2:
-      relayState.p1 = LOW;
-      break;
-    case 3:
-      relayState.p2 = LOW;
-      break;
-    case 4:
-      relayState.p3 = LOW;
-      break;
-    default:
-      break;
-  }
-
-  applyRelayState();
+void relayOff(uint8_t pin) {
+  relayBoard.digitalWrite(pin, HIGH);
 }
 
 void allRelaysOff() {
-  relayState.p0 = HIGH;
-  relayState.p1 = HIGH;
-  relayState.p2 = HIGH;
-  relayState.p3 = HIGH;
-  relayState.p4 = HIGH;
-  relayState.p5 = HIGH;
-  relayState.p6 = HIGH;
-  relayState.p7 = HIGH;
-  applyRelayState();
+  relayOff(RELAY1);
+  relayOff(RELAY2);
+  relayOff(RELAY3);
+  relayOff(RELAY4);
+  relayBoard.digitalWrite(P4, HIGH);
+  relayBoard.digitalWrite(P5, HIGH);
+  relayBoard.digitalWrite(P6, HIGH);
+  relayBoard.digitalWrite(P7, HIGH);
 }
 
 void pulseOnlyOneRelay(int piste) {
@@ -104,30 +75,30 @@ void pulseOnlyOneRelay(int piste) {
   switch (piste) {
     case 1:
       Serial.println("Pulse RELAY1");
-      setOnlyRelayActive(1);
+      relayOn(RELAY1);
       delay(RELAY_PULSE_ON_MS);
-      allRelaysOff();
+      relayOff(RELAY1);
       break;
 
     case 2:
       Serial.println("Pulse RELAY2");
-      setOnlyRelayActive(2);
+      relayOn(RELAY2);
       delay(RELAY_PULSE_ON_MS);
-      allRelaysOff();
+      relayOff(RELAY2);
       break;
 
     case 3:
       Serial.println("Pulse RELAY3");
-      setOnlyRelayActive(3);
+      relayOn(RELAY3);
       delay(RELAY_PULSE_ON_MS);
-      allRelaysOff();
+      relayOff(RELAY3);
       break;
 
     case 4:
       Serial.println("Pulse RELAY4");
-      setOnlyRelayActive(4);
+      relayOn(RELAY4);
       delay(RELAY_PULSE_ON_MS);
-      allRelaysOff();
+      relayOff(RELAY4);
       break;
 
     default:
