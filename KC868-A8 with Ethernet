@@ -18,7 +18,6 @@
 #define ARDUINOJSON_DEFAULT_NESTING_LIMIT 20
 
 // ===== KC868-A8v2 I2C / Relay board =====
-// KinCony examples use PCF8574(0x24,4,5)
 PCF8574 relayBoard(0x24, 4, 5);
 
 WebServer server(80);
@@ -28,7 +27,7 @@ StaticJsonDocument<2500> jsonDocument;
 #define RELAY1 P0
 #define RELAY2 P1
 #define RELAY3 P2
-#define RELAY4 P3 //<= Changed to P4 on defective card
+#define RELAY4 P3   // If relay 4 channel is defective on your board, change to P4
 
 volatile bool eth_connected = false;
 
@@ -37,11 +36,22 @@ int pendingPiste = 0;
 int pendingSessions = 0;
 bool pulsePending = false;
 
-// Coin pulse timing (fast but reliable for external pulse inputs)
+// Coin pulse timing
 const uint16_t RELAY_PRE_PULSE_MS = 20;
 const uint16_t RELAY_PULSE_ON_MS = 140;
 const uint16_t RELAY_POST_PULSE_MS = 80;
 const uint16_t RELAY_INTER_PULSE_GAP_MS = 180;
+
+// ===== Recovery / monitoring =====
+unsigned long bootMillis = 0;
+unsigned long lastEthUpMillis = 0;
+unsigned long ethDownSinceMillis = 0;
+unsigned long lastRequestMillis = 0;
+unsigned long lastHealthLogMillis = 0;
+
+const unsigned long BOOT_ETH_WAIT_MS     = 30000UL;   // wait max 30s at boot
+const unsigned long ETH_DOWN_RESTART_MS  = 120000UL;  // restart if ETH down > 2 min
+const unsigned long HEALTH_LOG_MS        = 300000UL;  // log every 5 min
 
 // =====================================================
 // Relay logic
@@ -128,16 +138,20 @@ void onEthEvent(WiFiEvent_t event) {
       Serial.print("ETH IP: ");
       Serial.println(ETH.localIP());
       eth_connected = true;
+      lastEthUpMillis = millis();
+      ethDownSinceMillis = 0;
       break;
 
     case ARDUINO_EVENT_ETH_DISCONNECTED:
       Serial.println("ETH Disconnected");
       eth_connected = false;
+      if (ethDownSinceMillis == 0) ethDownSinceMillis = millis();
       break;
 
     case ARDUINO_EVENT_ETH_STOP:
       Serial.println("ETH Stopped");
       eth_connected = false;
+      if (ethDownSinceMillis == 0) ethDownSinceMillis = millis();
       break;
 
     default:
@@ -149,10 +163,28 @@ void onEthEvent(WiFiEvent_t event) {
 // HTTP handlers
 // =====================================================
 void handlePing() {
+  lastRequestMillis = millis();
   server.send(200, "text/plain", "OK");
 }
 
+void handleHealth() {
+  lastRequestMillis = millis();
+
+  String msg = "{";
+  msg += "\"ok\":true,";
+  msg += "\"eth_connected\":" + String(eth_connected ? "true" : "false") + ",";
+  msg += "\"ip\":\"" + (eth_connected ? ETH.localIP().toString() : String("0.0.0.0")) + "\",";
+  msg += "\"uptime_ms\":" + String(millis() - bootMillis) + ",";
+  msg += "\"last_request_ms_ago\":" + String(lastRequestMillis == 0 ? -1 : (long)(millis() - lastRequestMillis)) + ",";
+  msg += "\"free_heap\":" + String(ESP.getFreeHeap());
+  msg += "}";
+
+  server.send(200, "application/json", msg);
+}
+
 void handleBody() {
+  lastRequestMillis = millis();
+
   if (!server.hasArg("plain")) {
     server.send(200, "text/plain", "Requette recue sans donnees");
     return;
@@ -215,6 +247,9 @@ void setup() {
   delay(500);
   Serial.println("Booting KC868-A8v2 Stripe Activation Board...");
 
+  bootMillis = millis();
+  lastHealthLogMillis = millis();
+
   // Configure ALL PCF8574 pins as outputs
   relayBoard.pinMode(P0, OUTPUT);
   relayBoard.pinMode(P1, OUTPUT);
@@ -244,16 +279,23 @@ void setup() {
   ETH.begin(ETH_PHY_ADDR, ETH_PHY_POWER, ETH_PHY_MDC, ETH_PHY_MDIO, ETH_PHY_TYPE, ETH_CLK_MODE);
 #endif
 
-  while (!eth_connected) {
+  unsigned long ethWaitStart = millis();
+  while (!eth_connected && (millis() - ethWaitStart < BOOT_ETH_WAIT_MS)) {
     delay(500);
     Serial.println("Waiting for Ethernet...");
   }
 
-  Serial.print("Board IP address: ");
-  Serial.println(ETH.localIP());
+  if (eth_connected) {
+    Serial.print("Board IP address: ");
+    Serial.println(ETH.localIP());
+  } else {
+    Serial.println("Ethernet not ready at boot, continuing anyway...");
+    ethDownSinceMillis = millis();
+  }
 
   server.on("/body", HTTP_ANY, handleBody);
   server.on("/ping", HTTP_GET, handlePing);
+  server.on("/health", HTTP_GET, handleHealth);
   server.begin();
 
   Serial.println("HTTP server started");
@@ -265,10 +307,39 @@ void setup() {
 void loop() {
   server.handleClient();
 
+  // Periodic health log
+  if (millis() - lastHealthLogMillis >= HEALTH_LOG_MS) {
+    Serial.println("===== HEALTH =====");
+    Serial.print("ETH connected: ");
+    Serial.println(eth_connected ? "YES" : "NO");
+    if (eth_connected) {
+      Serial.print("IP: ");
+      Serial.println(ETH.localIP());
+      lastEthUpMillis = millis();
+      ethDownSinceMillis = 0;
+    } else {
+      if (ethDownSinceMillis == 0) ethDownSinceMillis = millis();
+      Serial.print("ETH down for ms: ");
+      Serial.println(millis() - ethDownSinceMillis);
+    }
+    Serial.print("Free heap: ");
+    Serial.println(ESP.getFreeHeap());
+    Serial.print("Last request ms ago: ");
+    Serial.println(lastRequestMillis == 0 ? -1 : (long)(millis() - lastRequestMillis));
+    lastHealthLogMillis = millis();
+  }
+
+  // Auto-recovery if Ethernet stays down too long
+  if (!eth_connected && ethDownSinceMillis != 0 && (millis() - ethDownSinceMillis >= ETH_DOWN_RESTART_MS)) {
+    Serial.println("Ethernet down too long -> restarting board");
+    delay(200);
+    ESP.restart();
+  }
+
+  // Existing pulse logic kept unchanged
   if (pulsePending) {
     pulsePending = false;
 
-    // Original logic: if 1 session => one pulse, if 2 sessions => two pulses
     for (int i = 0; i < pendingSessions; i++) {
       pulseOnlyOneRelay(pendingPiste);
 
