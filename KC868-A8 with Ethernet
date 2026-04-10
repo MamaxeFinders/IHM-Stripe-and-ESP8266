@@ -56,6 +56,8 @@ const unsigned long ETH_DOWN_RESTART_MS  = 120000UL;  // restart if ETH down > 2
 const unsigned long HEALTH_LOG_MS        = 300000UL;  // log every 5 min
 const unsigned long ETH_WATCHDOG_MS      = 5000UL;    // verify ETH status every 5s
 const unsigned long ETH_REINIT_COOLDOWN_MS = 30000UL; // avoid reinit loops
+const unsigned long ETH_NO_IP_REINIT_MS  = 15000UL;   // link up but no IP for too long
+const unsigned long ETH_LINK_DOWN_REINIT_MS = 45000UL; // link down for too long
 
 // If your router DHCP is unstable, set to true and configure the values below.
 const bool USE_STATIC_ETH_IP = false;
@@ -89,7 +91,63 @@ void allRelaysOff() {
   relayBoard.digitalWrite(P6, HIGH);
   relayBoard.digitalWrite(P7, HIGH);
 }
-@@ -137,50 +149,96 @@ void onEthEvent(WiFiEvent_t event) {
+
+void pulseOnlyOneRelay(int piste) {
+  allRelaysOff();
+  delay(RELAY_PRE_PULSE_MS);
+
+  switch (piste) {
+    case 1:
+      Serial.println("Pulse RELAY1");
+      relayOn(RELAY1);
+      delay(RELAY_PULSE_ON_MS);
+      relayOff(RELAY1);
+      break;
+
+    case 2:
+      Serial.println("Pulse RELAY2");
+      relayOn(RELAY2);
+      delay(RELAY_PULSE_ON_MS);
+      relayOff(RELAY2);
+      break;
+
+    case 3:
+      Serial.println("Pulse RELAY3");
+      relayOn(RELAY3);
+      delay(RELAY_PULSE_ON_MS);
+      relayOff(RELAY3);
+      break;
+
+    case 4:
+      Serial.println("Pulse RELAY4");
+      relayOn(RELAY4);
+      delay(RELAY_PULSE_ON_MS);
+      relayOff(RELAY4);
+      break;
+
+    default:
+      Serial.println("Invalid piste");
+      break;
+  }
+
+  delay(RELAY_POST_PULSE_MS);
+  allRelaysOff();
+}
+
+// =====================================================
+// Ethernet events
+// =====================================================
+void onEthEvent(WiFiEvent_t event) {
+  switch (event) {
+    case ARDUINO_EVENT_ETH_START:
+      Serial.println("ETH Started");
+      ETH.setHostname("kc868-a8v2-stripe");
+      break;
+
+    case ARDUINO_EVENT_ETH_CONNECTED:
+      Serial.println("ETH Connected");
+      break;
+
     case ARDUINO_EVENT_ETH_GOT_IP:
       Serial.print("ETH IP: ");
       Serial.println(ETH.localIP());
@@ -158,7 +216,16 @@ void checkEthernetWatchdog() {
   eth_connected = false;
   if (ethDownSinceMillis == 0) ethDownSinceMillis = millis();
 
-  restartEthernetInterface();
+  unsigned long downDuration = millis() - ethDownSinceMillis;
+  bool shouldReinit =
+    (linkUp && !hasIp && downDuration >= ETH_NO_IP_REINIT_MS) ||
+    (!linkUp && downDuration >= ETH_LINK_DOWN_REINIT_MS);
+
+  if (shouldReinit) {
+    Serial.println(linkUp ? "ETH watchdog: link is up but IP missing -> reinit"
+                          : "ETH watchdog: link down too long -> reinit");
+    restartEthernetInterface();
+  }
 }
 
 // =====================================================
@@ -186,7 +253,76 @@ void handleHealth() {
 
 void handleBody() {
   lastRequestMillis = millis();
-@@ -257,77 +315,85 @@ void setup() {
+
+  if (!server.hasArg("plain")) {
+    server.send(200, "text/plain", "Requette recue sans donnees");
+    return;
+  }
+
+  String body = server.arg("plain");
+
+  Serial.println("BODY RECEIVED:");
+  Serial.println(body);
+
+  DeserializationError err = deserializeJson(jsonDocument, body);
+  if (err) {
+    Serial.print("JSON error: ");
+    Serial.println(err.c_str());
+    server.send(400, "text/plain", "JSON decode error");
+    return;
+  }
+
+  String prixUneSession = jsonDocument["data"]["object"]["metadata"]["PrixUneSession"] | "";
+  String prixDeuxSessions = jsonDocument["data"]["object"]["metadata"]["PrixDeuxSessions"] | "";
+  String pisteStr = jsonDocument["data"]["object"]["metadata"]["Piste"] | "";
+  String credit = jsonDocument["data"]["object"]["amount_total"] | "";
+  String transactionID = jsonDocument["id"] | "";
+
+  int piste = pisteStr.toInt();
+  int creditValue = credit.toInt();
+  int prixUneSessionValue = prixUneSession.toInt();
+  int prixDeuxSessionsValue = prixDeuxSessions.toInt();
+  int sessions = 0;
+
+  if (prixDeuxSessionsValue > 0 && creditValue >= prixDeuxSessionsValue) {
+    sessions = 2;
+  } else if (prixUneSessionValue > 0 && creditValue >= prixUneSessionValue) {
+    sessions = 1;
+  } else {
+    sessions = 1; // fallback
+  }
+
+  pendingPiste = piste;
+  pendingSessions = sessions;
+  pulsePending = true;
+
+  Serial.println("PISTE : " + String(piste));
+  Serial.println("CREDIT : " + credit);
+  Serial.println("PRIX UNE SESSION : " + prixUneSession);
+  Serial.println("PRIX DEUX SESSIONS : " + prixDeuxSessions);
+  Serial.println("NOMBRE DE SESSIONS : " + String(sessions));
+
+  server.send(200, "text/plain",
+              "Succes : =>" + transactionID + "<= Piste " + pisteStr +
+              " activee pour " + credit + " euros et " +
+              String(sessions) + " sessions");
+}
+
+// =====================================================
+// Setup
+// =====================================================
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("Booting KC868-A8v2 Stripe Activation Board...");
+
+  bootMillis = millis();
+  lastHealthLogMillis = millis();
+
+  // Configure ALL PCF8574 pins as outputs
+  relayBoard.pinMode(P0, OUTPUT);
+  relayBoard.pinMode(P1, OUTPUT);
+  relayBoard.pinMode(P2, OUTPUT);
   relayBoard.pinMode(P3, OUTPUT);
   relayBoard.pinMode(P4, OUTPUT);
   relayBoard.pinMode(P5, OUTPUT);
