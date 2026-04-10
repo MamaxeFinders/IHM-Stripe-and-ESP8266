@@ -48,10 +48,14 @@ unsigned long lastEthUpMillis = 0;
 unsigned long ethDownSinceMillis = 0;
 unsigned long lastRequestMillis = 0;
 unsigned long lastHealthLogMillis = 0;
+unsigned long lastEthWatchdogMillis = 0;
+unsigned long lastEthReinitMillis = 0;
 
 const unsigned long BOOT_ETH_WAIT_MS     = 30000UL;   // wait max 30s at boot
 const unsigned long ETH_DOWN_RESTART_MS  = 120000UL;  // restart if ETH down > 2 min
 const unsigned long HEALTH_LOG_MS        = 300000UL;  // log every 5 min
+const unsigned long ETH_WATCHDOG_MS      = 5000UL;    // verify ETH status every 5s
+const unsigned long ETH_REINIT_COOLDOWN_MS = 30000UL; // avoid reinit loops
 
 // =====================================================
 // Relay logic
@@ -157,6 +161,47 @@ void onEthEvent(WiFiEvent_t event) {
     default:
       break;
   }
+}
+
+void restartEthernetInterface() {
+  if (millis() - lastEthReinitMillis < ETH_REINIT_COOLDOWN_MS) return;
+
+  lastEthReinitMillis = millis();
+  Serial.println("ETH watchdog: restarting Ethernet interface");
+
+  ETH.stop();
+  delay(200);
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ETH.begin(ETH_PHY_TYPE, ETH_PHY_ADDR, ETH_PHY_MDC, ETH_PHY_MDIO, ETH_PHY_POWER, ETH_CLK_MODE);
+#else
+  ETH.begin(ETH_PHY_ADDR, ETH_PHY_POWER, ETH_PHY_MDC, ETH_PHY_MDIO, ETH_PHY_TYPE, ETH_CLK_MODE);
+#endif
+}
+
+void checkEthernetWatchdog() {
+  if (millis() - lastEthWatchdogMillis < ETH_WATCHDOG_MS) return;
+  lastEthWatchdogMillis = millis();
+
+  bool linkUp = ETH.linkUp();
+  bool hasIp = ETH.localIP() != INADDR_NONE && ETH.localIP().toString() != "0.0.0.0";
+  bool ethHealthy = linkUp && hasIp;
+
+  if (ethHealthy) {
+    if (!eth_connected) Serial.println("ETH watchdog: link restored");
+    eth_connected = true;
+    lastEthUpMillis = millis();
+    ethDownSinceMillis = 0;
+    return;
+  }
+
+  if (eth_connected) {
+    Serial.println("ETH watchdog: link/IP lost");
+  }
+
+  eth_connected = false;
+  if (ethDownSinceMillis == 0) ethDownSinceMillis = millis();
+
+  restartEthernetInterface();
 }
 
 // =====================================================
@@ -306,6 +351,7 @@ void setup() {
 // =====================================================
 void loop() {
   server.handleClient();
+  checkEthernetWatchdog();
 
   // Periodic health log
   if (millis() - lastHealthLogMillis >= HEALTH_LOG_MS) {
