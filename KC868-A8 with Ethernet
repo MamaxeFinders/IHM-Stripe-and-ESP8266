@@ -48,10 +48,22 @@ unsigned long lastEthUpMillis = 0;
 unsigned long ethDownSinceMillis = 0;
 unsigned long lastRequestMillis = 0;
 unsigned long lastHealthLogMillis = 0;
+unsigned long lastEthWatchdogMillis = 0;
+unsigned long lastEthReinitMillis = 0;
 
 const unsigned long BOOT_ETH_WAIT_MS     = 30000UL;   // wait max 30s at boot
 const unsigned long ETH_DOWN_RESTART_MS  = 120000UL;  // restart if ETH down > 2 min
 const unsigned long HEALTH_LOG_MS        = 300000UL;  // log every 5 min
+const unsigned long ETH_WATCHDOG_MS      = 5000UL;    // verify ETH status every 5s
+const unsigned long ETH_REINIT_COOLDOWN_MS = 30000UL; // avoid reinit loops
+
+// If your router DHCP is unstable, set to true and configure the values below.
+const bool USE_STATIC_ETH_IP = false;
+IPAddress ETH_LOCAL_IP(192, 168, 1, 90);
+IPAddress ETH_GATEWAY(192, 168, 1, 1);
+IPAddress ETH_SUBNET(255, 255, 255, 0);
+IPAddress ETH_DNS1(1, 1, 1, 1);
+IPAddress ETH_DNS2(8, 8, 8, 8);
 
 // =====================================================
 // Relay logic
@@ -77,63 +89,7 @@ void allRelaysOff() {
   relayBoard.digitalWrite(P6, HIGH);
   relayBoard.digitalWrite(P7, HIGH);
 }
-
-void pulseOnlyOneRelay(int piste) {
-  allRelaysOff();
-  delay(RELAY_PRE_PULSE_MS);
-
-  switch (piste) {
-    case 1:
-      Serial.println("Pulse RELAY1");
-      relayOn(RELAY1);
-      delay(RELAY_PULSE_ON_MS);
-      relayOff(RELAY1);
-      break;
-
-    case 2:
-      Serial.println("Pulse RELAY2");
-      relayOn(RELAY2);
-      delay(RELAY_PULSE_ON_MS);
-      relayOff(RELAY2);
-      break;
-
-    case 3:
-      Serial.println("Pulse RELAY3");
-      relayOn(RELAY3);
-      delay(RELAY_PULSE_ON_MS);
-      relayOff(RELAY3);
-      break;
-
-    case 4:
-      Serial.println("Pulse RELAY4");
-      relayOn(RELAY4);
-      delay(RELAY_PULSE_ON_MS);
-      relayOff(RELAY4);
-      break;
-
-    default:
-      Serial.println("Invalid piste");
-      break;
-  }
-
-  delay(RELAY_POST_PULSE_MS);
-  allRelaysOff();
-}
-
-// =====================================================
-// Ethernet events
-// =====================================================
-void onEthEvent(WiFiEvent_t event) {
-  switch (event) {
-    case ARDUINO_EVENT_ETH_START:
-      Serial.println("ETH Started");
-      ETH.setHostname("kc868-a8v2-stripe");
-      break;
-
-    case ARDUINO_EVENT_ETH_CONNECTED:
-      Serial.println("ETH Connected");
-      break;
-
+@@ -137,50 +149,96 @@ void onEthEvent(WiFiEvent_t event) {
     case ARDUINO_EVENT_ETH_GOT_IP:
       Serial.print("ETH IP: ");
       Serial.println(ETH.localIP());
@@ -157,6 +113,52 @@ void onEthEvent(WiFiEvent_t event) {
     default:
       break;
   }
+}
+
+void restartEthernetInterface() {
+  if (millis() - lastEthReinitMillis < ETH_REINIT_COOLDOWN_MS) return;
+
+  lastEthReinitMillis = millis();
+  Serial.println("ETH watchdog: restarting Ethernet interface");
+
+  ETH.stop();
+  delay(200);
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ETH.begin(ETH_PHY_TYPE, ETH_PHY_ADDR, ETH_PHY_MDC, ETH_PHY_MDIO, ETH_PHY_POWER, ETH_CLK_MODE);
+#else
+  ETH.begin(ETH_PHY_ADDR, ETH_PHY_POWER, ETH_PHY_MDC, ETH_PHY_MDIO, ETH_PHY_TYPE, ETH_CLK_MODE);
+#endif
+
+  if (USE_STATIC_ETH_IP) {
+    bool cfgOk = ETH.config(ETH_LOCAL_IP, ETH_GATEWAY, ETH_SUBNET, ETH_DNS1, ETH_DNS2);
+    Serial.println(cfgOk ? "ETH static IP reapplied" : "ETH static IP reapply failed");
+  }
+}
+
+void checkEthernetWatchdog() {
+  if (millis() - lastEthWatchdogMillis < ETH_WATCHDOG_MS) return;
+  lastEthWatchdogMillis = millis();
+
+  bool linkUp = ETH.linkUp();
+  bool hasIp = ETH.localIP() != INADDR_NONE && ETH.localIP().toString() != "0.0.0.0";
+  bool ethHealthy = linkUp && hasIp;
+
+  if (ethHealthy) {
+    if (!eth_connected) Serial.println("ETH watchdog: link restored");
+    eth_connected = true;
+    lastEthUpMillis = millis();
+    ethDownSinceMillis = 0;
+    return;
+  }
+
+  if (eth_connected) {
+    Serial.println("ETH watchdog: link/IP lost");
+  }
+
+  eth_connected = false;
+  if (ethDownSinceMillis == 0) ethDownSinceMillis = millis();
+
+  restartEthernetInterface();
 }
 
 // =====================================================
@@ -184,76 +186,7 @@ void handleHealth() {
 
 void handleBody() {
   lastRequestMillis = millis();
-
-  if (!server.hasArg("plain")) {
-    server.send(200, "text/plain", "Requette recue sans donnees");
-    return;
-  }
-
-  String body = server.arg("plain");
-
-  Serial.println("BODY RECEIVED:");
-  Serial.println(body);
-
-  DeserializationError err = deserializeJson(jsonDocument, body);
-  if (err) {
-    Serial.print("JSON error: ");
-    Serial.println(err.c_str());
-    server.send(400, "text/plain", "JSON decode error");
-    return;
-  }
-
-  String prixUneSession = jsonDocument["data"]["object"]["metadata"]["PrixUneSession"] | "";
-  String prixDeuxSessions = jsonDocument["data"]["object"]["metadata"]["PrixDeuxSessions"] | "";
-  String pisteStr = jsonDocument["data"]["object"]["metadata"]["Piste"] | "";
-  String credit = jsonDocument["data"]["object"]["amount_total"] | "";
-  String transactionID = jsonDocument["id"] | "";
-
-  int piste = pisteStr.toInt();
-  int creditValue = credit.toInt();
-  int prixUneSessionValue = prixUneSession.toInt();
-  int prixDeuxSessionsValue = prixDeuxSessions.toInt();
-  int sessions = 0;
-
-  if (prixDeuxSessionsValue > 0 && creditValue >= prixDeuxSessionsValue) {
-    sessions = 2;
-  } else if (prixUneSessionValue > 0 && creditValue >= prixUneSessionValue) {
-    sessions = 1;
-  } else {
-    sessions = 1; // fallback
-  }
-
-  pendingPiste = piste;
-  pendingSessions = sessions;
-  pulsePending = true;
-
-  Serial.println("PISTE : " + String(piste));
-  Serial.println("CREDIT : " + credit);
-  Serial.println("PRIX UNE SESSION : " + prixUneSession);
-  Serial.println("PRIX DEUX SESSIONS : " + prixDeuxSessions);
-  Serial.println("NOMBRE DE SESSIONS : " + String(sessions));
-
-  server.send(200, "text/plain",
-              "Succes : =>" + transactionID + "<= Piste " + pisteStr +
-              " activee pour " + credit + " euros et " +
-              String(sessions) + " sessions");
-}
-
-// =====================================================
-// Setup
-// =====================================================
-void setup() {
-  Serial.begin(115200);
-  delay(500);
-  Serial.println("Booting KC868-A8v2 Stripe Activation Board...");
-
-  bootMillis = millis();
-  lastHealthLogMillis = millis();
-
-  // Configure ALL PCF8574 pins as outputs
-  relayBoard.pinMode(P0, OUTPUT);
-  relayBoard.pinMode(P1, OUTPUT);
-  relayBoard.pinMode(P2, OUTPUT);
+@@ -257,77 +315,85 @@ void setup() {
   relayBoard.pinMode(P3, OUTPUT);
   relayBoard.pinMode(P4, OUTPUT);
   relayBoard.pinMode(P5, OUTPUT);
@@ -278,6 +211,13 @@ void setup() {
 #else
   ETH.begin(ETH_PHY_ADDR, ETH_PHY_POWER, ETH_PHY_MDC, ETH_PHY_MDIO, ETH_PHY_TYPE, ETH_CLK_MODE);
 #endif
+
+  if (USE_STATIC_ETH_IP) {
+    bool cfgOk = ETH.config(ETH_LOCAL_IP, ETH_GATEWAY, ETH_SUBNET, ETH_DNS1, ETH_DNS2);
+    Serial.println(cfgOk ? "ETH static IP configured" : "ETH static IP configuration failed");
+  } else {
+    Serial.println("ETH uses DHCP");
+  }
 
   unsigned long ethWaitStart = millis();
   while (!eth_connected && (millis() - ethWaitStart < BOOT_ETH_WAIT_MS)) {
@@ -306,6 +246,7 @@ void setup() {
 // =====================================================
 void loop() {
   server.handleClient();
+  checkEthernetWatchdog();
 
   // Periodic health log
   if (millis() - lastHealthLogMillis >= HEALTH_LOG_MS) {
