@@ -1,4 +1,3 @@
- (cd "$(git rev-parse --show-toplevel)" && git apply --3way <<'EOF' 
 diff --git a/README.md b/README.md
 index 8691df74abea48b53919b912c7fdeb07546e72fc..ac7c976337311e121e83140fdeaeea6afc50f47c 100644
 --- a/README.md
@@ -41,6 +40,3 @@ index 8691df74abea48b53919b912c7fdeb07546e72fc..ac7c976337311e121e83140fdeaeea6a
 +- If link is up but no IP is present for ~15s, Ethernet is reinitialized.
 +- If physical link is down for ~45s, Ethernet is reinitialized.
 +- If Ethernet remains down for 2 minutes, the ESP32 is fully restarted.
- 
-EOF
-)
