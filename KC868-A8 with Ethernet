@@ -24,10 +24,11 @@ WebServer server(80);
 StaticJsonDocument<2500> jsonDocument;
 
 // ===== Relay mapping =====
+// If relay 4 channel is defective on your board, change RELAY4 to P4
 #define RELAY1 P0
 #define RELAY2 P1
 #define RELAY3 P2
-#define RELAY4 P3   // If relay 4 channel is defective on your board, change to P4
+#define RELAY4 P3
 
 volatile bool eth_connected = false;
 
@@ -44,24 +45,25 @@ const uint16_t RELAY_INTER_PULSE_GAP_MS = 180;
 
 // ===== Recovery / monitoring =====
 unsigned long bootMillis = 0;
-unsigned long lastEthUpMillis = 0;
 unsigned long ethDownSinceMillis = 0;
 unsigned long lastRequestMillis = 0;
 unsigned long lastHealthLogMillis = 0;
 unsigned long lastEthWatchdogMillis = 0;
-unsigned long lastEthReinitMillis = 0;
 
-const unsigned long BOOT_ETH_WAIT_MS     = 30000UL;   // wait max 30s at boot
-const unsigned long ETH_DOWN_RESTART_MS  = 120000UL;  // restart if ETH down > 2 min
-const unsigned long HEALTH_LOG_MS        = 300000UL;  // log every 5 min
-const unsigned long ETH_WATCHDOG_MS      = 5000UL;    // verify ETH status every 5s
-const unsigned long ETH_REINIT_COOLDOWN_MS = 30000UL; // avoid reinit loops
-const unsigned long ETH_NO_IP_REINIT_MS  = 15000UL;   // link up but no IP for too long
-const unsigned long ETH_LINK_DOWN_REINIT_MS = 45000UL; // link down for too long
+// Boot / watchdog timings
+const unsigned long BOOT_ETH_WAIT_MS         = 30000UL;    // wait max 30s at boot
+const unsigned long ETH_WATCHDOG_MS          = 5000UL;     // verify ETH every 5s
+const unsigned long ETH_NO_IP_RESTART_MS     = 20000UL;    // link up but no IP too long
+const unsigned long ETH_LINK_DOWN_RESTART_MS = 120000UL;   // restart if link down > 2 min
+const unsigned long HEALTH_LOG_MS            = 300000UL;   // serial health log every 5 min
 
-// If your router DHCP is unstable, set to true and configure the values below.
+// Optional preventive reboot once per day
+const bool ENABLE_DAILY_REBOOT = false;
+const unsigned long DAILY_REBOOT_MS = 24UL * 60UL * 60UL * 1000UL;
+
+// Keep false if you use Livebox "Baux DHCP statiques"
 const bool USE_STATIC_ETH_IP = false;
-IPAddress ETH_LOCAL_IP(192, 168, 1, 90);
+IPAddress ETH_LOCAL_IP(192, 168, 1, 16);
 IPAddress ETH_GATEWAY(192, 168, 1, 1);
 IPAddress ETH_SUBNET(255, 255, 255, 0);
 IPAddress ETH_DNS1(1, 1, 1, 1);
@@ -82,10 +84,10 @@ void relayOff(uint8_t pin) {
 }
 
 void allRelaysOff() {
-  relayOff(RELAY1);
-  relayOff(RELAY2);
-  relayOff(RELAY3);
-  relayOff(RELAY4);
+  relayBoard.digitalWrite(P0, HIGH);
+  relayBoard.digitalWrite(P1, HIGH);
+  relayBoard.digitalWrite(P2, HIGH);
+  relayBoard.digitalWrite(P3, HIGH);
   relayBoard.digitalWrite(P4, HIGH);
   relayBoard.digitalWrite(P5, HIGH);
   relayBoard.digitalWrite(P6, HIGH);
@@ -135,6 +137,17 @@ void pulseOnlyOneRelay(int piste) {
 }
 
 // =====================================================
+// Safe restart
+// =====================================================
+void restartBoard(const char* reason) {
+  Serial.print("Restarting board: ");
+  Serial.println(reason);
+  allRelaysOff();
+  delay(200);
+  ESP.restart();
+}
+
+// =====================================================
 // Ethernet events
 // =====================================================
 void onEthEvent(WiFiEvent_t event) {
@@ -152,7 +165,6 @@ void onEthEvent(WiFiEvent_t event) {
       Serial.print("ETH IP: ");
       Serial.println(ETH.localIP());
       eth_connected = true;
-      lastEthUpMillis = millis();
       ethDownSinceMillis = 0;
       break;
 
@@ -173,14 +185,10 @@ void onEthEvent(WiFiEvent_t event) {
   }
 }
 
-void restartEthernetInterface() {
-  if (millis() - lastEthReinitMillis < ETH_REINIT_COOLDOWN_MS) return;
-
-  lastEthReinitMillis = millis();
-  Serial.println("ETH watchdog: restarting Ethernet interface");
-
-  ETH.stop();
-  delay(200);
+// =====================================================
+// Ethernet start helper
+// =====================================================
+void startEthernet() {
 #if ESP_ARDUINO_VERSION_MAJOR >= 3
   ETH.begin(ETH_PHY_TYPE, ETH_PHY_ADDR, ETH_PHY_MDC, ETH_PHY_MDIO, ETH_PHY_POWER, ETH_CLK_MODE);
 #else
@@ -189,42 +197,40 @@ void restartEthernetInterface() {
 
   if (USE_STATIC_ETH_IP) {
     bool cfgOk = ETH.config(ETH_LOCAL_IP, ETH_GATEWAY, ETH_SUBNET, ETH_DNS1, ETH_DNS2);
-    Serial.println(cfgOk ? "ETH static IP reapplied" : "ETH static IP reapply failed");
+    Serial.println(cfgOk ? "ETH static IP configured" : "ETH static IP configuration failed");
+  } else {
+    Serial.println("ETH uses DHCP");
   }
 }
 
+// =====================================================
+// Ethernet watchdog
+// =====================================================
 void checkEthernetWatchdog() {
   if (millis() - lastEthWatchdogMillis < ETH_WATCHDOG_MS) return;
   lastEthWatchdogMillis = millis();
 
   bool linkUp = ETH.linkUp();
-  bool hasIp = ETH.localIP() != INADDR_NONE && ETH.localIP().toString() != "0.0.0.0";
-  bool ethHealthy = linkUp && hasIp;
+  IPAddress ip = ETH.localIP();
+  bool hasIp = (ip[0] != 0 || ip[1] != 0 || ip[2] != 0 || ip[3] != 0);
 
-  if (ethHealthy) {
-    if (!eth_connected) Serial.println("ETH watchdog: link restored");
+  if (linkUp && hasIp) {
     eth_connected = true;
-    lastEthUpMillis = millis();
     ethDownSinceMillis = 0;
     return;
-  }
-
-  if (eth_connected) {
-    Serial.println("ETH watchdog: link/IP lost");
   }
 
   eth_connected = false;
   if (ethDownSinceMillis == 0) ethDownSinceMillis = millis();
 
   unsigned long downDuration = millis() - ethDownSinceMillis;
-  bool shouldReinit =
-    (linkUp && !hasIp && downDuration >= ETH_NO_IP_REINIT_MS) ||
-    (!linkUp && downDuration >= ETH_LINK_DOWN_REINIT_MS);
 
-  if (shouldReinit) {
-    Serial.println(linkUp ? "ETH watchdog: link is up but IP missing -> reinit"
-                          : "ETH watchdog: link down too long -> reinit");
-    restartEthernetInterface();
+  if (linkUp && !hasIp && downDuration >= ETH_NO_IP_RESTART_MS) {
+    restartBoard("ETH link up but no IP too long");
+  }
+
+  if (!linkUp && downDuration >= ETH_LINK_DOWN_RESTART_MS) {
+    restartBoard("ETH link down too long");
   }
 }
 
@@ -289,7 +295,7 @@ void handleBody() {
   } else if (prixUneSessionValue > 0 && creditValue >= prixUneSessionValue) {
     sessions = 1;
   } else {
-    sessions = 1; // fallback
+    sessions = 1;
   }
 
   pendingPiste = piste;
@@ -319,7 +325,7 @@ void setup() {
   bootMillis = millis();
   lastHealthLogMillis = millis();
 
-  // Configure ALL PCF8574 pins as outputs
+  // Configure all PCF8574 pins as outputs
   relayBoard.pinMode(P0, OUTPUT);
   relayBoard.pinMode(P1, OUTPUT);
   relayBoard.pinMode(P2, OUTPUT);
@@ -335,25 +341,13 @@ void setup() {
     Serial.println("PCF8574 relay board found.");
   }
 
-  // Default state = ALL RELAYS OFF
+  // Safe startup: relays OFF only, no test pulse
   allRelaysOff();
   delay(200);
   allRelaysOff();
 
   WiFi.onEvent(onEthEvent);
-
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
-  ETH.begin(ETH_PHY_TYPE, ETH_PHY_ADDR, ETH_PHY_MDC, ETH_PHY_MDIO, ETH_PHY_POWER, ETH_CLK_MODE);
-#else
-  ETH.begin(ETH_PHY_ADDR, ETH_PHY_POWER, ETH_PHY_MDC, ETH_PHY_MDIO, ETH_PHY_TYPE, ETH_CLK_MODE);
-#endif
-
-  if (USE_STATIC_ETH_IP) {
-    bool cfgOk = ETH.config(ETH_LOCAL_IP, ETH_GATEWAY, ETH_SUBNET, ETH_DNS1, ETH_DNS2);
-    Serial.println(cfgOk ? "ETH static IP configured" : "ETH static IP configuration failed");
-  } else {
-    Serial.println("ETH uses DHCP");
-  }
+  startEthernet();
 
   unsigned long ethWaitStart = millis();
   while (!eth_connected && (millis() - ethWaitStart < BOOT_ETH_WAIT_MS)) {
@@ -384,36 +378,33 @@ void loop() {
   server.handleClient();
   checkEthernetWatchdog();
 
-  // Periodic health log
   if (millis() - lastHealthLogMillis >= HEALTH_LOG_MS) {
     Serial.println("===== HEALTH =====");
     Serial.print("ETH connected: ");
     Serial.println(eth_connected ? "YES" : "NO");
+
     if (eth_connected) {
       Serial.print("IP: ");
       Serial.println(ETH.localIP());
-      lastEthUpMillis = millis();
-      ethDownSinceMillis = 0;
     } else {
       if (ethDownSinceMillis == 0) ethDownSinceMillis = millis();
       Serial.print("ETH down for ms: ");
       Serial.println(millis() - ethDownSinceMillis);
     }
+
     Serial.print("Free heap: ");
     Serial.println(ESP.getFreeHeap());
+
     Serial.print("Last request ms ago: ");
     Serial.println(lastRequestMillis == 0 ? -1 : (long)(millis() - lastRequestMillis));
+
     lastHealthLogMillis = millis();
   }
 
-  // Auto-recovery if Ethernet stays down too long
-  if (!eth_connected && ethDownSinceMillis != 0 && (millis() - ethDownSinceMillis >= ETH_DOWN_RESTART_MS)) {
-    Serial.println("Ethernet down too long -> restarting board");
-    delay(200);
-    ESP.restart();
+  if (ENABLE_DAILY_REBOOT && (millis() - bootMillis >= DAILY_REBOOT_MS)) {
+    restartBoard("Daily preventive reboot");
   }
 
-  // Existing pulse logic kept unchanged
   if (pulsePending) {
     pulsePending = false;
 
