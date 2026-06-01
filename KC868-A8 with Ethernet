@@ -24,22 +24,23 @@ WebServer server(80);
 StaticJsonDocument<2500> jsonDocument;
 
 // ===== Relay mapping =====
-// If relay 4 channel is defective on your board, change RELAY4 to P4
-#define RELAY1 P0
-#define RELAY2 P1
-#define RELAY3 P2
-#define RELAY4 P3
+// Physical relay number 1..8 maps to PCF8574 pins P0..P7.
+const uint8_t RELAY_COUNT = 8;
+const uint8_t RELAY_PINS[RELAY_COUNT] = { P0, P1, P2, P3, P4, P5, P6, P7 };
 
 volatile bool eth_connected = false;
 
 // One request = one pulse job
-int pendingPiste = 0;
+int pendingRelayNumber = 0;
 int pendingSessions = 0;
+uint16_t pendingPulseMs = 0;
 bool pulsePending = false;
 
 // Coin pulse timing
 const uint16_t RELAY_PRE_PULSE_MS = 20;
 const uint16_t RELAY_PULSE_ON_MS = 140;
+const uint16_t RELAY_MIN_PULSE_MS = 50;
+const uint16_t RELAY_MAX_PULSE_MS = 10000;
 const uint16_t RELAY_POST_PULSE_MS = 80;
 const uint16_t RELAY_INTER_PULSE_GAP_MS = 180;
 
@@ -84,53 +85,107 @@ void relayOff(uint8_t pin) {
 }
 
 void allRelaysOff() {
-  relayBoard.digitalWrite(P0, HIGH);
-  relayBoard.digitalWrite(P1, HIGH);
-  relayBoard.digitalWrite(P2, HIGH);
-  relayBoard.digitalWrite(P3, HIGH);
-  relayBoard.digitalWrite(P4, HIGH);
-  relayBoard.digitalWrite(P5, HIGH);
-  relayBoard.digitalWrite(P6, HIGH);
-  relayBoard.digitalWrite(P7, HIGH);
+  for (uint8_t i = 0; i < RELAY_COUNT; i++) {
+    relayBoard.digitalWrite(RELAY_PINS[i], HIGH);
+  }
 }
 
-void pulseOnlyOneRelay(int piste) {
+bool isValidRelayNumber(int relayNumber) {
+  return relayNumber >= 1 && relayNumber <= RELAY_COUNT;
+}
+
+int relayNumberFromPiste(int piste) {
+  switch (piste) {
+    case 1:
+    case 2:
+    case 3:
+      return piste;
+
+    case 4:
+      return 5; // Physical relay 4 is damaged, so Piste 4 uses relay 5 / P4.
+
+    case 6:
+      return 6; // RESET uses relay 6 / P5.
+
+    default:
+      return 0;
+  }
+}
+
+String metadataValue(JsonObject metadata, const char* key) {
+  JsonVariant value = metadata[key];
+  if (value.isNull()) return "";
+  return value.as<String>();
+}
+
+String firstMetadataValue(JsonObject metadata, const char* key1, const char* key2, const char* key3) {
+  String value = metadataValue(metadata, key1);
+  if (value.length() > 0) return value;
+
+  value = metadataValue(metadata, key2);
+  if (value.length() > 0) return value;
+
+  return metadataValue(metadata, key3);
+}
+
+int readRelayNumberFromPayload() {
+  JsonObject metadata = jsonDocument["data"]["object"]["metadata"];
+
+  String relayStr = firstMetadataValue(metadata, "Relay", "relay", "RELAY");
+  if (relayStr.length() > 0) {
+    return relayStr.toInt();
+  }
+
+  String relayPinStr = firstMetadataValue(metadata, "RelayPin", "relayPin", "RELAY_PIN");
+  if (relayPinStr.length() > 0) {
+    int pinNumber = relayPinStr.toInt();
+    if (pinNumber >= 0 && pinNumber <= 7) {
+      return pinNumber + 1;
+    }
+  }
+
+  String pisteStr = firstMetadataValue(metadata, "Piste", "piste", "PISTE");
+  return relayNumberFromPiste(pisteStr.toInt());
+}
+
+uint16_t clampPulseMs(unsigned long pulseMs) {
+  if (pulseMs == 0) return RELAY_PULSE_ON_MS;
+  if (pulseMs < RELAY_MIN_PULSE_MS) return RELAY_MIN_PULSE_MS;
+  if (pulseMs > RELAY_MAX_PULSE_MS) return RELAY_MAX_PULSE_MS;
+  return (uint16_t)pulseMs;
+}
+
+uint16_t readPulseMsFromPayload() {
+  JsonObject metadata = jsonDocument["data"]["object"]["metadata"];
+
+  String pulseMsStr = firstMetadataValue(metadata, "RelayDurationMs", "PulseMs", "DurationMs");
+  if (pulseMsStr.length() > 0) {
+    return clampPulseMs(pulseMsStr.toInt());
+  }
+
+  String pulseSecStr = firstMetadataValue(metadata, "RelayDurationSeconds", "PulseSeconds", "DurationSeconds");
+  if (pulseSecStr.length() > 0) {
+    return clampPulseMs((unsigned long)pulseSecStr.toInt() * 1000UL);
+  }
+
+  return RELAY_PULSE_ON_MS;
+}
+
+void pulseOnlyOneRelay(int relayNumber, uint16_t pulseMs) {
+  if (!isValidRelayNumber(relayNumber)) {
+    Serial.println("Invalid relay number: " + String(relayNumber));
+    allRelaysOff();
+    return;
+  }
+
   allRelaysOff();
   delay(RELAY_PRE_PULSE_MS);
 
-  switch (piste) {
-    case 1:
-      Serial.println("Pulse RELAY1");
-      relayOn(RELAY1);
-      delay(RELAY_PULSE_ON_MS);
-      relayOff(RELAY1);
-      break;
-
-    case 2:
-      Serial.println("Pulse RELAY2");
-      relayOn(RELAY2);
-      delay(RELAY_PULSE_ON_MS);
-      relayOff(RELAY2);
-      break;
-
-    case 3:
-      Serial.println("Pulse RELAY3");
-      relayOn(RELAY3);
-      delay(RELAY_PULSE_ON_MS);
-      relayOff(RELAY3);
-      break;
-
-    case 4:
-      Serial.println("Pulse RELAY4");
-      relayOn(RELAY4);
-      delay(RELAY_PULSE_ON_MS);
-      relayOff(RELAY4);
-      break;
-
-    default:
-      Serial.println("Invalid piste");
-      break;
-  }
+  uint8_t relayPin = RELAY_PINS[relayNumber - 1];
+  Serial.println("Pulse RELAY" + String(relayNumber) + " / P" + String(relayNumber - 1) + " for " + String(pulseMs) + " ms");
+  relayOn(relayPin);
+  delay(pulseMs);
+  relayOff(relayPin);
 
   delay(RELAY_POST_PULSE_MS);
   allRelaysOff();
@@ -281,14 +336,28 @@ void handleBody() {
   String prixUneSession = jsonDocument["data"]["object"]["metadata"]["PrixUneSession"] | "";
   String prixDeuxSessions = jsonDocument["data"]["object"]["metadata"]["PrixDeuxSessions"] | "";
   String pisteStr = jsonDocument["data"]["object"]["metadata"]["Piste"] | "";
+  JsonObject metadata = jsonDocument["data"]["object"]["metadata"];
+  String relayStr = firstMetadataValue(metadata, "Relay", "relay", "RELAY");
+  String relayPinStr = firstMetadataValue(metadata, "RelayPin", "relayPin", "RELAY_PIN");
+  String pulseMsStr = firstMetadataValue(metadata, "RelayDurationMs", "PulseMs", "DurationMs");
+  String pulseSecStr = firstMetadataValue(metadata, "RelayDurationSeconds", "PulseSeconds", "DurationSeconds");
   String credit = jsonDocument["data"]["object"]["amount_total"] | "";
   String transactionID = jsonDocument["id"] | "";
 
   int piste = pisteStr.toInt();
+  int relayNumber = readRelayNumberFromPayload();
+  uint16_t pulseMs = readPulseMsFromPayload();
   int creditValue = credit.toInt();
   int prixUneSessionValue = prixUneSession.toInt();
   int prixDeuxSessionsValue = prixDeuxSessions.toInt();
   int sessions = 0;
+
+  if (!isValidRelayNumber(relayNumber)) {
+    allRelaysOff();
+    Serial.println("Invalid relay request. Piste: " + pisteStr + " Relay: " + relayStr + " RelayPin: " + relayPinStr);
+    server.send(400, "text/plain", "Invalid relay request. Use metadata.Relay 1-8, metadata.RelayPin 0-7, or supported metadata.Piste.");
+    return;
+  }
 
   if (prixDeuxSessionsValue > 0 && creditValue >= prixDeuxSessionsValue) {
     sessions = 2;
@@ -298,11 +367,16 @@ void handleBody() {
     sessions = 1;
   }
 
-  pendingPiste = piste;
+  pendingRelayNumber = relayNumber;
   pendingSessions = sessions;
+  pendingPulseMs = pulseMs;
   pulsePending = true;
 
   Serial.println("PISTE : " + String(piste));
+  Serial.println("RELAY : " + String(relayNumber));
+  Serial.println("PULSE MS : " + String(pulseMs));
+  Serial.println("PULSE REQUEST MS : " + pulseMsStr);
+  Serial.println("PULSE REQUEST SECONDS : " + pulseSecStr);
   Serial.println("CREDIT : " + credit);
   Serial.println("PRIX UNE SESSION : " + prixUneSession);
   Serial.println("PRIX DEUX SESSIONS : " + prixDeuxSessions);
@@ -310,6 +384,8 @@ void handleBody() {
 
   server.send(200, "text/plain",
               "Succes : =>" + transactionID + "<= Piste " + pisteStr +
+              " Relay " + String(relayNumber) +
+              " PulseMs " + String(pulseMs) +
               " activee pour " + credit + " euros et " +
               String(sessions) + " sessions");
 }
@@ -407,17 +483,19 @@ void loop() {
 
   if (pulsePending) {
     pulsePending = false;
+    uint16_t pulseMs = pendingPulseMs > 0 ? pendingPulseMs : RELAY_PULSE_ON_MS;
 
     for (int i = 0; i < pendingSessions; i++) {
-      pulseOnlyOneRelay(pendingPiste);
+      pulseOnlyOneRelay(pendingRelayNumber, pulseMs);
 
       if (i < (pendingSessions - 1)) {
         delay(RELAY_INTER_PULSE_GAP_MS);
       }
     }
 
-    pendingPiste = 0;
+    pendingRelayNumber = 0;
     pendingSessions = 0;
+    pendingPulseMs = 0;
     allRelaysOff();
   }
 }
